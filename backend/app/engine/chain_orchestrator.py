@@ -97,8 +97,22 @@ class ChainOrchestrator:
     # ───────────────────────────────────────────────
     # 链路 2: 查询服务链
     # ───────────────────────────────────────────────
-    def run_query_service_chain(self, api_id: int, template_id: int, params: dict[str, Any]) -> dict[str, Any]:
-        """查询服务链：API服务→SQL模板→查询优化→数据预览。"""
+    def run_query_service_chain(
+        self,
+        api_id: int,
+        template_id: int | None,
+        params: dict[str, Any],
+        *,
+        result_rows: list[Any] | None = None,
+    ) -> dict[str, Any]:
+        """查询服务链：API服务→SQL契约包→查询优化→数据预览。
+
+        SQL、参数声明与返回字段全部取自接口SQL契约包里本次生效的那一版快照，
+        不再直接读模板或接口上的 SQL 文本。模板处于草稿/待校验，或契约只校验了一半，
+        都不会被拿来执行。
+        """
+        from app.engine.sql_contract import contract_registry, shape_rows
+
         result = {"chain": "query_service", "steps": [], "ok": True}
 
         # Step 1: API服务
@@ -107,31 +121,59 @@ class ChainOrchestrator:
             result["ok"] = False
             result["steps"].append({"step": 1, "module": "api_service", "status": "error", "detail": f"接口 {api_id} 不存在"})
             return result
+        api_code = str(api.get("接口编号") or "")
         if api.get("status") != "已发布":
             result["steps"].append({"step": 1, "module": "api_service", "status": "warning", "detail": f"接口状态为 {api.get('status')}"})
         else:
-            result["steps"].append({"step": 1, "module": "api_service", "status": "ok", "detail": f"接口 {api.get('接口编号')} 已发布"})
+            result["steps"].append({"step": 1, "module": "api_service", "status": "ok", "detail": f"接口 {api_code} 已发布"})
 
-        # Step 2: SQL模板绑定
-        bind_result = self.binder.expand_template(template_id, params)
+        # Step 2: 本次请求固定的契约版本
+        contract = contract_registry.pin(api_code)
+        if contract is None:
+            result["ok"] = False
+            result["steps"].append({
+                "step": 2, "module": "sql_template", "status": "error",
+                "detail": f"接口 {api_code} 尚无已发布的SQL契约包，查询服务链不能取数",
+            })
+            return result
+        if template_id is not None and contract.template_id != template_id:
+            result["steps"].append({
+                "step": 2, "module": "sql_template", "status": "warning",
+                "detail": f"请求模板 {template_id} 与生效契约版本 {contract.version_label} 的模板 "
+                          f"{contract.template_ref} 不一致，按契约版本执行",
+            })
+
+        # Step 3: 按契约声明的参数绑定 SQL
+        bind_result = self.binder.bind_contract(contract, params)
         if not bind_result.get("ok"):
             result["ok"] = False
             result["steps"].append({"step": 2, "module": "sql_template", "status": "error", "detail": "; ".join(bind_result.get("errors", []))})
             return result
-        result["steps"].append({"step": 2, "module": "sql_template", "status": "ok", "detail": "SQL绑定成功", "bound_sql": bind_result["sql"]})
+        result["steps"].append({
+            "step": 2, "module": "sql_template", "status": "ok",
+            "detail": f"按契约 {contract.version_label} 绑定成功，参数 {len(contract.params)} 个",
+            "bound_sql": bind_result["sql"],
+            "contract": bind_result["contract"],
+        })
 
-        # Step 3: 查询优化
+        # Step 4: 查询优化
         opt_report = self.optimizer.analyze_sql(bind_result["sql"], api_id=api_id)
         result["steps"].append({"step": 3, "module": "query_optimize", "status": "ok", "detail": f"预估成本 {opt_report.get('estimated_cost', 0)}", "suggestions": opt_report.get("index_suggestions", [])})
 
-        # Step 4: 数据预览
-        preview = next((r for r in store.rows("data_preview") if r.get("模板编号") == api.get("接口编号")), None)
+        # Step 5: 数据预览
+        preview = next((r for r in store.rows("data_preview") if r.get("模板编号") == api_code), None)
         if preview:
             result["steps"].append({"step": 4, "module": "data_preview", "status": "ok", "detail": f"预览模板 {preview.get('模板编号')} 已关联"})
         else:
             result["steps"].append({"step": 4, "module": "data_preview", "status": "warning", "detail": "未找到关联的预览模板"})
 
         result["bound_sql"] = bind_result["sql"]
+        result["params"] = bind_result["params"]
+        result["bindings"] = bind_result["bindings"]
+        result["return_fields"] = list(contract.return_fields)
+        result["contract"] = bind_result["contract"]
+        # 返回列顺序由本次固定的契约版本决定，与模板/接口当前文本无关。
+        result["rows"] = shape_rows(contract, result_rows) if result_rows is not None else []
         result["optimization"] = opt_report
         return result
 

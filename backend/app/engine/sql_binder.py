@@ -117,18 +117,132 @@ class SqlTemplateBinder:
         return self.bind(sql_text, values)
 
     def expand_api_query(self, api_id: int, values: dict[str, Any]) -> dict[str, Any]:
-        """按API接口编号加载SQL并展开（API服务→SQL模板→查询执行链）。"""
+        """按API接口编号加载SQL并展开（API服务→已发布SQL契约包→查询执行链）。
+
+        只读取接口SQL契约包里当前生效的那一版：SQL、参数声明、返回字段都来自同一份
+        不可变快照，避免参数和返回列读到不同版本。
+        """
+        from app.engine.sql_contract import contract_registry
+
         api = store.find("api_service", api_id)
         if not api:
             return {"ok": False, "errors": [f"接口 {api_id} 不存在"], "sql": None}
-        sql_text = api.get("查询SQL", "")
-        # 如果接口引用了模板，先加载模板
-        tmpl_ref = api.get("参数列表", "")
-        if tmpl_ref.startswith("SQL-"):
-            tmpl = next((r for r in store.rows("sql_template") if r.get("模板编号") == tmpl_ref), None)
-            if tmpl:
-                sql_text = tmpl.get("SQL片段", sql_text)
-        return self.bind(sql_text, values)
+        api_code = str(api.get("接口编号") or "")
+        contract = contract_registry.pin(api_code)
+        if contract is None:
+            return {
+                "ok": False,
+                "errors": [f"接口 {api_code} 尚无已发布的SQL契约包，不能执行绑定"],
+                "sql": None,
+                "params": [],
+                "contract": None,
+            }
+        return self.bind_contract(contract, values)
+
+    def bind_contract(self, contract: Any, values: dict[str, Any]) -> dict[str, Any]:
+        """按契约版本声明的参数类型绑定，并返回该版契约的返回字段顺序。"""
+        errors: list[str] = []
+        resolved: dict[str, Any] = {}
+        for spec in contract.params:
+            val = values.get(spec.name)
+            if val is None or (isinstance(val, str) and val == ""):
+                val = spec.default
+            if val is None:
+                if spec.required:
+                    errors.append(f"参数 {spec.name} 未提供")
+                continue
+            resolved[spec.name] = val
+        extra = sorted(set(values) - {spec.name for spec in contract.params})
+        if extra:
+            errors.append(f"参数 {', '.join(extra)} 不在契约声明中")
+
+        # SQL 里出现但契约没有声明的占位符同样不能被静默放过。
+        declared = {spec.name for spec in contract.params}
+        for param in self.parse_params(contract.sql):
+            if param["name"] not in declared:
+                errors.append(f"SQL占位符 {param['name']} 未在契约参数声明中")
+
+        if errors:
+            return {
+                "ok": False,
+                "errors": errors,
+                "sql": None,
+                "params": [],
+                "return_fields": list(contract.return_fields),
+                "contract": self._contract_meta(contract),
+            }
+
+        # 绑定前按契约声明的类型做一次校验。
+        type_errors: list[str] = []
+        for spec in contract.params:
+            if spec.name not in resolved:
+                continue
+            val_str = str(resolved[spec.name])
+            if spec.type == "list":
+                continue
+            pattern = self.TYPE_PATTERNS.get(spec.type, self.TYPE_PATTERNS["str"])
+            if not re.match(pattern, val_str):
+                type_errors.append(f"参数 {spec.name} 值 '{val_str}' 不符合类型 {spec.type}")
+        if type_errors:
+            return {
+                "ok": False,
+                "errors": type_errors,
+                "sql": None,
+                "params": [],
+                "return_fields": list(contract.return_fields),
+                "contract": self._contract_meta(contract),
+            }
+
+        spec_by_name = {spec.name: spec for spec in contract.params}
+        bound_params: list[Any] = []
+
+        def replace_list(m: re.Match) -> str:
+            name = m.group(1)
+            val = resolved.get(name, [])
+            if isinstance(val, str):
+                val = [v.strip() for v in val.split(",") if v.strip()]
+            placeholders = ", ".join(f"${len(bound_params) + j + 1}" for j in range(len(val)))
+            bound_params.extend(val)
+            return placeholders
+
+        bound_sql = re.sub(r"\{\{(\w+):list\}\}", replace_list, contract.sql)
+
+        def replace_param(m: re.Match) -> str:
+            name = m.group(1)
+            spec = spec_by_name.get(name)
+            ptype = spec.type if spec else (m.group(2) or "str")
+            val = resolved.get(name)
+            if ptype == "int":
+                val = int(val)  # type: ignore[arg-type]
+            elif ptype == "float":
+                val = float(val)  # type: ignore[arg-type]
+            bound_params.append(val)
+            return f"${len(bound_params)}"
+
+        bound_sql = re.sub(r"\{\{(\w+)(?::(\w+))?\}\}", replace_param, bound_sql)
+
+        return {
+            "ok": True,
+            "errors": [],
+            "sql": bound_sql,
+            "params": bound_params,
+            "bindings": {name: resolved[name] for name in resolved},
+            "return_fields": list(contract.return_fields),
+            "contract": self._contract_meta(contract),
+        }
+
+    @staticmethod
+    def _contract_meta(contract: Any) -> dict[str, Any]:
+        return {
+            "api_code": contract.api_code,
+            "version_no": contract.version_no,
+            "version_label": contract.version_label,
+            "template_ref": contract.template_ref,
+            "template_version": contract.template_version,
+            "checksum": contract.checksum,
+            "params": [spec.as_dict() for spec in contract.params],
+            "return_fields": list(contract.return_fields),
+        }
 
     def _find_template_by_sql(self, sql_text: str) -> dict[str, Any] | None:
         for r in store.rows("sql_template"):

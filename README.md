@@ -67,6 +67,24 @@ npm run dev
 | SQL模板 | `sql_template` | 模板定义 | 模板编号、模板名称、SQL片段 |
 | 结果缓存 | `result_cache` | 缓存配置 | 配置编号、缓存键、缓存引擎 |
 | 查询审计 | `query_audit` | 审计日志 | 日志编号、接口编号、调用方 |
+| 接口SQL契约包 | `api_contract` | 契约版本 | 接口编号、版本、参数声明、返回字段 |
+
+## 接口SQL契约包
+
+`backend/app/engine/sql_contract.py` 把一次查询的 **SQL、参数声明、返回字段** 冻结成不可变
+版本（`ContractSnapshot`），一个接口同一时刻只有一个生效版本。
+
+- **发布前校验**：`POST /api/api_contract/packages/{api_id}/validate` 启动会话，
+  `POST /api/api_contract/validations/{token}/check` 一起确认 SQL、参数类型与返回字段；
+  只有状态为「已校验」的会话才能 `publish`。草稿/待校验模板、只校验一半的会话、
+  字段与投影不一致的契约都进不了发布结果。
+- **一次请求一版契约**：API 服务绑定（`SqlTemplateBinder.expand_api_query` /
+  `bind_contract`）与查询服务链（`run_query_service_chain`）都从契约包读取本次生效快照，
+  参数绑定和结果整形（`shape_rows`）使用同一份快照，不会出现参数读新版、返回列读旧版。
+- **中断与并发**：`abort` 只丢弃候选版本；校验开始时会对关联模板做指纹快照，发布时
+  重新比对，校验期间模板被更正则本次校验失效（`校验失效`），旧版本继续对外取数，
+  重新校验并发布后新版参数与列一起生效。
+- 「发布接口」动作在 `ApiServiceService.run_action` 里复用同一套预校验，失败时接口状态不变。
 
 ## 约定
 

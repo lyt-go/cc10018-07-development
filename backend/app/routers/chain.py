@@ -27,11 +27,12 @@ def chain_metric_compute(domain_code: str, metric_code: str, aggregate_id: int) 
 
 @router.post("/query-service")
 def chain_query_service(payload: dict[str, Any]) -> dict[str, Any]:
-    """链路2: 查询服务链（API服务→SQL模板→查询优化→数据预览）。"""
+    """链路2: 查询服务链（API服务→SQL契约包→查询优化→数据预览）。"""
     api_id = payload.get("api_id")
     template_id = payload.get("template_id")
     params = payload.get("params", {})
-    result = orchestrator.run_query_service_chain(api_id, template_id, params)
+    result = orchestrator.run_query_service_chain(
+        api_id, template_id, params, result_rows=payload.get("rows"))
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result)
     return result

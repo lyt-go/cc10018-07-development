@@ -25,5 +25,6 @@ from app.routers import sql_template as router_sql_template
 from app.routers import result_cache as router_result_cache
 from app.routers import query_audit as router_query_audit
 from app.routers import chain as router_chain
+from app.routers import api_contract as router_api_contract
 
-ROUTERS = [router_metric_domain, router_derived_metric, router_api_service, router_query_optimize, router_api_subscribe, router_call_credential, router_datasource_connect, router_call_trace, router_data_preview, router_api_version, router_batch_export, router_metric_homonym, router_data_aggregate, router_data_cleanse, router_access_dashboard, router_sql_template, router_result_cache, router_query_audit, router_chain]
+ROUTERS = [router_metric_domain, router_derived_metric, router_api_service, router_query_optimize, router_api_subscribe, router_call_credential, router_datasource_connect, router_call_trace, router_data_preview, router_api_version, router_batch_export, router_metric_homonym, router_data_aggregate, router_data_cleanse, router_access_dashboard, router_sql_template, router_result_cache, router_query_audit, router_chain, router_api_contract]

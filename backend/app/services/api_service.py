@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.services.sql_contract import SqlContractService
 from app.store import store
 
 MODULE = "api_service"
@@ -14,6 +15,9 @@ NEGATIVE_ACTIONS = ["下线接口"]
 
 
 class ApiServiceService:
+    def __init__(self) -> None:
+        self.contracts = SqlContractService()
+
     def list_entries(
         self,
         *,
@@ -50,6 +54,12 @@ class ApiServiceService:
         rows.append(entry)
         return entry, []
 
+    def _needs_contract(self, entry: dict[str, Any]) -> bool:
+        """没有关联 SQL 模板的接口不涉及契约包，沿用原发布流程。"""
+        template_ref = str(entry.get("参数列表") or "").strip()
+        return template_ref.startswith("SQL-") or any(
+            row.get("模板编号") == template_ref for row in store.rows("sql_template"))
+
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
         entry = store.find(MODULE, entry_id)
         if entry is None:
@@ -59,7 +69,19 @@ class ApiServiceService:
         target = ACTION_RULES[action]
         if target not in STATUS_ORDER:
             return None, f"目标状态「{target}」不在允许的状态序列里"
+
+        contract_note = ""
+        if action == "发布接口" and self._needs_contract(entry):
+            # 发布前校验：SQL、参数类型、返回字段必须来自同一版已校验契约，
+            # 校验不通过时接口状态保持原样，生效版本也不动。
+            snapshot, contract_note = self.contracts.validate_and_publish_entry(entry)
+            if snapshot is None:
+                return None, f"发布前校验未通过，接口未发布：{contract_note}"
+
         entry["status"] = target
         entry["pending"] = target != STATUS_ORDER[-1]
         entry["abnormal"] = action in NEGATIVE_ACTIONS
-        return entry, f"数据接口已{action}"
+        message = f"数据接口已{action}"
+        if contract_note:
+            message = f"{message}；{contract_note}"
+        return entry, message
